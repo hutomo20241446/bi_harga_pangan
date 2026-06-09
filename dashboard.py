@@ -26,7 +26,7 @@ st.set_page_config(
 
 @st.cache_data(ttl=300)
 def fetch_wilayah():
-    with psycopg.connect(DATABASE_URL) as conn:
+    with psycopg2.connect(DATABASE_URL) as conn:
         with conn.cursor() as cur:
             cur.execute("""
                 SELECT wilayah_key, provinsi, kabupaten_kota
@@ -39,7 +39,7 @@ def fetch_wilayah():
 
 @st.cache_data(ttl=300)
 def fetch_komoditas():
-    with psycopg.connect(DATABASE_URL) as conn:
+    with psycopg2.connect(DATABASE_URL) as conn:
         with conn.cursor() as cur:
             cur.execute("""
                 SELECT komoditas_key, komoditas, unit
@@ -71,7 +71,7 @@ def fetch_harga(wilayah_keys: tuple, komoditas_key: int, tanggal_mulai: str, tan
     """
     params = list(wilayah_keys) + [komoditas_key, tanggal_mulai, tanggal_akhir]
 
-    with psycopg.connect(DATABASE_URL) as conn:
+    with psycopg2.connect(DATABASE_URL) as conn:
         with conn.cursor() as cur:
             cur.execute(query, params)
             rows = cur.fetchall()
