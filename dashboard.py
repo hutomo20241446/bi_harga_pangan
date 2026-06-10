@@ -99,14 +99,16 @@ def fetch_harga(
             rows = cur.fetchall()
     if not rows:
         return pd.DataFrame()
-    df = pd.DataFrame(rows, columns=["tanggal", "kabupaten_kota", "komoditas", "unit", "harga"])
+    df = pd.DataFrame(
+        rows,
+        columns=["tanggal", "kabupaten_kota", "komoditas", "unit", "harga"]
+    )
     df["tanggal"] = pd.to_datetime(df["tanggal"])
     df["harga"] = pd.to_numeric(df["harga"], errors="coerce")
     return df
 
 
 def run_ai_query(sql: str) -> pd.DataFrame:
-    """Eksekusi SQL dari AI, hanya SELECT yang diizinkan."""
     sql_clean = sql.strip().rstrip(";")
     if not re.match(r"^\s*SELECT\b", sql_clean, re.IGNORECASE):
         raise ValueError("Hanya query SELECT yang diizinkan.")
@@ -115,82 +117,60 @@ def run_ai_query(sql: str) -> pd.DataFrame:
 
 
 def build_system_prompt(wilayah_list, komoditas_list) -> str:
-    wilayah_info = "\n".join(
-        f"  - wilayah_key={w['wilayah_key']}: {w['kabupaten_kota']}"
-        for w in wilayah_list
+    wilayah_names = ", ".join(w["kabupaten_kota"] for w in wilayah_list)
+    komoditas_names = ", ".join(
+        f"{k['komoditas']} ({k['unit']})" for k in komoditas_list
     )
-    komoditas_info = "\n".join(
-        f"  - komoditas_key={k['komoditas_key']}: {k['komoditas']} ({k['unit']})"
-        for k in komoditas_list
-    )
-
     return f"""Kamu adalah asisten analisis harga pangan Jawa Tengah.
 Kamu memiliki akses ke database PostgreSQL dengan skema berikut:
 
-TABLE dim_wilayah (
-    wilayah_key INTEGER PRIMARY KEY,
-    provinsi VARCHAR(100),
-    kabupaten_kota VARCHAR(100)
-)
+TABLE dim_wilayah (wilayah_key INTEGER PK, provinsi VARCHAR, kabupaten_kota VARCHAR)
+TABLE dim_komoditas (komoditas_key INTEGER PK, komoditas VARCHAR, unit VARCHAR)
+TABLE fact_harga_harian (tanggal DATE, wilayah_key INT FK, komoditas_key INT FK, harga NUMERIC(12,2))
 
-TABLE dim_komoditas (
-    komoditas_key INTEGER PRIMARY KEY,
-    komoditas VARCHAR(150),
-    unit VARCHAR(10)
-)
-
-TABLE fact_harga_harian (
-    tanggal DATE,
-    wilayah_key INTEGER,  -- FK ke dim_wilayah
-    komoditas_key INTEGER, -- FK ke dim_komoditas
-    harga NUMERIC(12,2)
-)
-
-Data yang tersedia:
-WILAYAH (35 kabupaten/kota di Jawa Tengah):
-{wilayah_info}
-
-KOMODITAS (17 komoditas):
-{komoditas_info}
+Wilayah tersedia (35 kabupaten/kota di Jawa Tengah): {wilayah_names}
+Komoditas tersedia: {komoditas_names}
 
 INSTRUKSI:
-1. Jawab pertanyaan pengguna tentang harga pangan.
-2. Selalu buat SQL query untuk mengambil data yang relevan.
-3. Kembalikan response dalam format JSON PERSIS seperti ini:
-{{
-  "sql": "SELECT ... FROM ... WHERE ...",
-  "penjelasan_query": "Penjelasan singkat apa yang dicari query ini",
-  "catatan": "Catatan tambahan jika ada (opsional, bisa null)"
-}}
-4. SQL harus valid PostgreSQL, hanya SELECT, maksimal LIMIT 200.
-5. Gunakan JOIN ke dim_wilayah dan dim_komoditas untuk nama yang readable.
-6. Untuk perbandingan harga antar wilayah gunakan AVG(harga).
-7. Jika pertanyaan tidak bisa dijawab dengan data yang ada, tetap kembalikan JSON dengan sql: null.
+1. Buat SQL query PostgreSQL valid, hanya SELECT, LIMIT 200.
+2. Selalu JOIN ke dim_wilayah dan dim_komoditas agar nama readable.
+3. Kembalikan JSON PERSIS seperti ini tanpa markdown atau backtick:
+{{"sql": "SELECT ...", "penjelasan_query": "...", "catatan": null}}
+4. Jika pertanyaan tidak bisa dijawab dengan data yang ada, kembalikan sql: null.
 """
 
 
 def ask_gemini(pertanyaan: str, wilayah_list, komoditas_list) -> dict:
-    """Kirim pertanyaan ke Gemini, dapat SQL balik."""
-    model = genai.GenerativeModel("gemini-2.0-flash")
-    system_prompt = build_system_prompt(wilayah_list, komoditas_list)
-
-    full_prompt = f"{system_prompt}\n\nPertanyaan pengguna: {pertanyaan}"
-
+    model = genai.GenerativeModel("gemini-2.5-flash-lite")
+    prompt = build_system_prompt(wilayah_list, komoditas_list)
+    full_prompt = f"{prompt}\n\nPertanyaan pengguna: {pertanyaan}"
     response = model.generate_content(full_prompt)
     raw = response.text.strip()
-
-    # Bersihkan markdown code block jika ada
     raw = re.sub(r"^```(?:json)?\s*", "", raw)
     raw = re.sub(r"\s*```$", "", raw)
-
     try:
         return json.loads(raw)
     except json.JSONDecodeError:
-        # Fallback: coba ekstrak JSON dari teks
         match = re.search(r"\{.*\}", raw, re.DOTALL)
         if match:
             return json.loads(match.group())
-        raise ValueError(f"Respons Gemini tidak valid JSON:\n{raw}")
+        raise ValueError(f"Respons AI tidak valid JSON:\n{raw}")
+
+
+def summarize_gemini(pertanyaan: str, df_result: pd.DataFrame) -> str:
+    model = genai.GenerativeModel("gemini-2.5-flash-lite")
+    data_preview = df_result.head(20).to_string(index=False)
+    prompt = f"""Berdasarkan pertanyaan: "{pertanyaan}"
+
+Data hasil query (maks 20 baris pertama):
+{data_preview}
+
+Total baris: {len(df_result)}
+
+Berikan ringkasan analisis singkat dan insightful dalam 2-4 kalimat bahasa Indonesia.
+Fokus pada temuan utama, angka penting, dan kesimpulan yang actionable."""
+    response = model.generate_content(prompt)
+    return response.text.strip()
 
 
 # =========================================================
@@ -232,9 +212,15 @@ with st.sidebar:
     )
     col1, col2 = st.columns(2)
     with col1:
-        tgl_mulai = st.date_input("Dari", value=date.today() - timedelta(days=90))
+        tgl_mulai = st.date_input(
+            "Dari",
+            value=date.today() - timedelta(days=90),
+        )
     with col2:
-        tgl_akhir = st.date_input("Sampai", value=date.today())
+        tgl_akhir = st.date_input(
+            "Sampai",
+            value=date.today(),
+        )
 
 # =========================================================
 # VALIDASI
@@ -254,7 +240,9 @@ if tgl_mulai > tgl_akhir:
 
 wilayah_keys = tuple(wilayah_map[w] for w in selected_wilayah)
 komoditas_key = komoditas_map[selected_komoditas]
-komoditas_unit = next(k["unit"] for k in komoditas_list if k["komoditas"] == selected_komoditas)
+komoditas_unit = next(
+    k["unit"] for k in komoditas_list if k["komoditas"] == selected_komoditas
+)
 
 with st.spinner("Mengambil data..."):
     df = fetch_harga(
@@ -294,12 +282,20 @@ tab1, tab2, tab3, tab4 = st.tabs([
 ])
 
 with tab1:
-    trend = df.groupby(["tanggal", "kabupaten_kota"])["harga"].mean().reset_index()
+    trend = (
+        df.groupby(["tanggal", "kabupaten_kota"])["harga"]
+        .mean()
+        .reset_index()
+    )
     fig = px.line(trend, x="tanggal", y="harga", color="kabupaten_kota")
     st.plotly_chart(fig, use_container_width=True)
 
 with tab2:
-    bar = df.groupby("kabupaten_kota")["harga"].mean().reset_index()
+    bar = (
+        df.groupby("kabupaten_kota")["harga"]
+        .mean()
+        .reset_index()
+    )
     fig2 = px.bar(bar, x="kabupaten_kota", y="harga")
     st.plotly_chart(fig2, use_container_width=True)
 
@@ -324,53 +320,45 @@ with tab4:
         "menjalankannya ke database, lalu merangkum hasilnya."
     )
 
-    # Contoh pertanyaan sebagai inspirasi
     with st.expander("💡 Contoh pertanyaan"):
-        contoh = [
+        for contoh in [
             "Wilayah mana yang punya harga beras paling mahal bulan ini?",
             "Bandingkan rata-rata harga cabai merah di Semarang dan Solo minggu lalu",
             "Tren harga minyak goreng di seluruh Jawa Tengah 30 hari terakhir",
             "5 komoditas dengan harga tertinggi hari ini",
             "Wilayah dengan harga bawang merah paling murah",
-        ]
-        for c in contoh:
-            st.markdown(f"- *{c}*")
+        ]:
+            st.markdown(f"- *{contoh}*")
 
-    # Inisialisasi chat history di session state
     if "ai_chat_history" not in st.session_state:
         st.session_state.ai_chat_history = []
 
-    # Tampilkan riwayat chat
-    chat_container = st.container()
-    with chat_container:
-        for entry in st.session_state.ai_chat_history:
-            with st.chat_message("user"):
-                st.write(entry["pertanyaan"])
-            with st.chat_message("assistant"):
-                if entry.get("error"):
-                    st.error(entry["error"])
-                else:
-                    if entry.get("penjelasan_query"):
-                        st.caption(f"🔍 Query: {entry['penjelasan_query']}")
-                    if entry.get("df_result") is not None and not entry["df_result"].empty:
-                        st.dataframe(entry["df_result"], use_container_width=True)
-                    if entry.get("ringkasan"):
-                        st.markdown(entry["ringkasan"])
-                    if entry.get("catatan"):
-                        st.info(entry["catatan"])
-                    if entry.get("sql"):
-                        with st.expander("🔎 Lihat SQL yang dijalankan"):
-                            st.code(entry["sql"], language="sql")
+    for entry in st.session_state.ai_chat_history:
+        with st.chat_message("user"):
+            st.write(entry["pertanyaan"])
+        with st.chat_message("assistant"):
+            if entry.get("error"):
+                st.error(entry["error"])
+            else:
+                if entry.get("penjelasan_query"):
+                    st.caption(f"🔍 {entry['penjelasan_query']}")
+                if entry.get("df_result") is not None and not entry["df_result"].empty:
+                    st.dataframe(entry["df_result"], use_container_width=True)
+                if entry.get("ringkasan"):
+                    st.markdown(entry["ringkasan"])
+                if entry.get("catatan"):
+                    st.info(entry["catatan"])
+                if entry.get("sql"):
+                    with st.expander("🔎 Lihat SQL yang dijalankan"):
+                        st.code(entry["sql"], language="sql")
 
-    # Input pertanyaan
-    pertanyaan = st.chat_input("Ketik pertanyaan Anda tentang harga pangan...")
+    pertanyaan = st.chat_input("Ketik pertanyaan tentang harga pangan...")
 
     if pertanyaan:
-        with st.spinner("AI sedang berpikir..."):
+        with st.spinner("AI sedang memproses..."):
             entry = {"pertanyaan": pertanyaan}
-
             try:
-                # Step 1: Minta Gemini generate SQL
+                # Step 1: generate SQL
                 ai_response = ask_gemini(pertanyaan, wilayah_list, komoditas_list)
                 sql = ai_response.get("sql")
                 entry["penjelasan_query"] = ai_response.get("penjelasan_query", "")
@@ -383,28 +371,17 @@ with tab4:
                         "dengan data yang tersedia di database."
                     )
                 else:
-                    # Step 2: Jalankan SQL ke database
+                    # Step 2: eksekusi SQL
                     df_result = run_ai_query(sql)
                     entry["df_result"] = df_result
 
-                    # Step 3: Minta Gemini rangkum hasil
+                    # Step 3: ringkas hasil
                     if df_result.empty:
-                        entry["ringkasan"] = "Query berhasil dijalankan namun tidak ada data yang ditemukan."
+                        entry["ringkasan"] = (
+                            "Query berhasil dijalankan namun tidak ada data ditemukan."
+                        )
                     else:
-                        data_preview = df_result.head(20).to_string(index=False)
-                        ringkasan_prompt = f"""Berdasarkan pertanyaan: "{pertanyaan}"
-
-Data hasil query (maks 20 baris pertama):
-{data_preview}
-
-Total baris: {len(df_result)}
-
-Berikan ringkasan analisis singkat dan insightful dalam 2-4 kalimat dalam bahasa Indonesia. 
-Fokus pada temuan utama, angka penting, dan kesimpulan yang actionable."""
-
-                        model = genai.GenerativeModel("gemini-2.0-flash")
-                        ringkasan_resp = model.generate_content(ringkasan_prompt)
-                        entry["ringkasan"] = ringkasan_resp.text.strip()
+                        entry["ringkasan"] = summarize_gemini(pertanyaan, df_result)
 
             except ValueError as ve:
                 entry["error"] = f"⚠️ {ve}"
@@ -414,7 +391,6 @@ Fokus pada temuan utama, angka penting, dan kesimpulan yang actionable."""
             st.session_state.ai_chat_history.append(entry)
             st.rerun()
 
-    # Tombol reset history
     if st.session_state.ai_chat_history:
         if st.button("🗑️ Hapus Riwayat Chat", type="secondary"):
             st.session_state.ai_chat_history = []
